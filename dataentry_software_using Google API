@@ -1,0 +1,454 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import csv, sqlite3, json, base64, threading, urllib.request, urllib.error
+from datetime import datetime, date
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from PIL import Image, ImageTk
+import io, os
+
+# ── Config ────────────────────────────────────────────────────────────────────
+DB_FILE    = 'data.db'
+CSV_FILE   = 'output.csv'
+EXCEL_FILE = 'muktajivan_patients.xlsx'
+API_KEY_FILE = 'api_key.txt'
+
+HEADERS = ['Pt_Name','Ref_Doctor','Treatment_Type','Sonography_Date',
+           'Report_Type','Price','Sonography_Doctor']
+
+TREATMENT_TYPES = [
+    "USG Abdomen","Doppler","Mammography","Neck","Gravid Uterus",
+    "Tapping","Scrotum","Breast","Brain","Local Part","Ovulation Study","Chest"
+]
+REPORT_TYPES = ["SC - Only Report","P - Report With Sonography Photo"]
+
+EXCEL_HEADERS = ['No','Patient Name','Ref Doctor','Treatment Type',
+                 'Sonography Date','Report Type','Price (Rs)','Sonography Doctor']
+
+# ── Database ──────────────────────────────────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute('''CREATE TABLE IF NOT EXISTS Muktajivan_Data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        Pt_Name TEXT, Ref_Doctor TEXT, Treatment_Type TEXT,
+        Sonography_Date TEXT, Report_Type TEXT,
+        Price TEXT, Sonography_Doctor TEXT)''')
+    conn.commit(); conn.close()
+
+def export_csv():
+    conn = sqlite3.connect(DB_FILE)
+    rows = conn.execute("SELECT Pt_Name,Ref_Doctor,Treatment_Type,Sonography_Date,Report_Type,Price,Sonography_Doctor FROM Muktajivan_Data").fetchall()
+    conn.close()
+    with open(CSV_FILE,'w',newline='') as f:
+        w = csv.writer(f); w.writerow(HEADERS); w.writerows(rows)
+
+def export_excel():
+    conn = sqlite3.connect(DB_FILE)
+    rows = conn.execute("SELECT Pt_Name,Ref_Doctor,Treatment_Type,Sonography_Date,Report_Type,Price,Sonography_Doctor FROM Muktajivan_Data").fetchall()
+    conn.close()
+    wb = Workbook(); ws = wb.active; ws.title = "Patient Records"
+    # Title
+    ws.merge_cells('A1:H1')
+    ws['A1'] = 'MUKTAJIVAN SONOGRAPHY — PATIENT RECORDS'
+    ws['A1'].font = Font(name='Arial',bold=True,size=13,color='FFFFFF')
+    ws['A1'].fill = PatternFill('solid',fgColor='1F4E79')
+    ws['A1'].alignment = Alignment(horizontal='center',vertical='center')
+    ws.row_dimensions[1].height = 26
+    # Headers
+    thin = Side(style='thin',color='4472C4')
+    bdr  = Border(left=thin,right=thin,top=thin,bottom=thin)
+    for c,h in enumerate(EXCEL_HEADERS,1):
+        cell = ws.cell(row=2,column=c,value=h)
+        cell.font  = Font(name='Arial',bold=True,size=10)
+        cell.fill  = PatternFill('solid',fgColor='BDD7EE')
+        cell.alignment = Alignment(horizontal='center')
+        cell.border = bdr
+    ws.row_dimensions[2].height = 16
+    # Data rows
+    fill1 = PatternFill('solid',fgColor='EBF3FA')
+    fill2 = PatternFill('solid',fgColor='FFFFFF')
+    for i,row in enumerate(rows,1):
+        r = i+2
+        ws.cell(row=r,column=1,value=i)
+        for c,val in enumerate(row,2):
+            cell = ws.cell(row=r,column=c,value=val)
+            cell.font   = Font(name='Arial',size=10)
+            cell.fill   = fill1 if i%2==0 else fill2
+            cell.border = bdr
+            cell.alignment = Alignment(horizontal='center' if c in [1,5,7] else 'left')
+        ws.row_dimensions[r].height = 15
+    # Column widths
+    for i,w in enumerate([5,22,22,18,14,24,10,18],1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = 'A3'
+    wb.save(EXCEL_FILE)
+    return EXCEL_FILE
+
+# ── API Key helpers ───────────────────────────────────────────────────────────
+def load_api_key():
+    if os.path.exists(API_KEY_FILE):
+        with open(API_KEY_FILE) as f: return f.read().strip()
+    return ''
+
+def save_api_key(key):
+    with open(API_KEY_FILE,'w') as f: f.write(key.strip())
+
+# ── Claude AI extraction ──────────────────────────────────────────────────────
+def call_gemini_api(image_path, api_key):
+    with open(image_path,'rb') as f: raw = f.read()
+    b64 = base64.b64encode(raw).decode()
+    ext = os.path.splitext(image_path)[1].lower()
+    mime = {'jpg':'image/jpeg','jpeg':'image/jpeg','png':'image/png',
+            'webp':'image/webp','gif':'image/gif'}.get(ext.lstrip('.'),'image/jpeg')
+
+    prompt = """You are reading a handwritten patient register for a sonography clinic.
+Extract ALL patient rows visible in this image.
+
+Return ONLY a JSON array (no markdown, no explanation), like:
+[
+  {
+    "pt_name": "Patient full name",
+    "ref_doctor": "Referring doctor name",
+    "treatment_type": "one of: USG Abdomen, Doppler, Mammography, Neck, Gravid Uterus, Tapping, Scrotum, Breast, Brain, Local Part, Ovulation Study, Chest — pick closest match",
+    "date": "DD/MM/YYYY or as written",
+    "report_type": "SC - Only Report or P - Report With Sonography Photo — guess from SC or P written",
+    "price": "number only or empty",
+    "sono_doctor": "sonography doctor name or empty"
+  }
+]
+Extract every row. If a field is unreadable write empty string."""
+
+    payload = json.dumps({
+        "contents": [{
+            "parts": [
+                {"inline_data": {"mime_type": mime, "data": b64}},
+                {"text": prompt}
+            ]
+        }],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2000}
+    }).encode()
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    req = urllib.request.Request(url, data=payload, headers={'Content-Type':'application/json'})
+
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        result = json.loads(resp.read())
+
+    text = result['candidates'][0]['content']['parts'][0]['text']
+    text = text.strip()
+    if text.startswith('```'): text = text.split('```')[1].lstrip('json').strip()
+    if text.endswith('```'): text = text[:text.rfind('```')]
+    return json.loads(text)
+
+# ── Clear form ────────────────────────────────────────────────────────────────
+def clear_form():
+    # Only clear Patient Name and Price; keep all other fields for next entry
+    pt_entry.delete(0, tk.END)
+    price_entry.delete(0, tk.END)
+    pt_entry.focus()
+
+def full_clear_form():
+    # Full reset of ALL fields (called by the Clear Form button)
+    pt_entry.delete(0, tk.END)
+    doc_entry.delete(0, tk.END)
+    treatment_combo.set('')
+    report_combo.set('')
+    day_spin.delete(0, tk.END);   day_spin.insert(0, datetime.today().day)
+    month_spin.delete(0, tk.END); month_spin.insert(0, datetime.today().month)
+    year_spin.delete(0, tk.END);  year_spin.insert(0, datetime.today().year)
+    price_entry.delete(0, tk.END)
+    sonodoc_entry.delete(0, tk.END)
+    pt_entry.focus()
+
+# ── Save single record ────────────────────────────────────────────────────────
+def savedata():
+    pt_name  = pt_entry.get().strip()
+    doc_name = doc_entry.get().strip()
+    tre_type = treatment_combo.get().strip()
+    sono_type= report_combo.get().strip()
+    price    = price_entry.get().strip()
+    sono_doc = sonodoc_entry.get().strip()
+    if not pt_name:  messagebox.showwarning("Validation","Patient Name required."); pt_entry.focus(); return
+    if not doc_name: messagebox.showwarning("Validation","Ref Doctor required.");   doc_entry.focus(); return
+    if not tre_type: messagebox.showwarning("Validation","Select Treatment Type."); return
+    if not sono_type:messagebox.showwarning("Validation","Select Report Type.");    return
+    try:
+        sono_date = f"{int(day_spin.get()):02d}/{int(month_spin.get()):02d}/{year_spin.get()}"
+    except ValueError:
+        messagebox.showwarning("Validation","Invalid date."); return
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("INSERT INTO Muktajivan_Data(Pt_Name,Ref_Doctor,Treatment_Type,Sonography_Date,Report_Type,Price,Sonography_Doctor) VALUES(?,?,?,?,?,?,?)",
+                 (pt_name,doc_name,tre_type,sono_date,sono_type,price,sono_doc))
+    conn.commit(); conn.close()
+    export_csv()
+    messagebox.showinfo("Saved",f"Record for '{pt_name}' saved!")
+    # ── Only clear Patient Name & Price; keep all other fields for next entry ──
+    pt_entry.delete(0, tk.END)
+    price_entry.delete(0, tk.END)
+    pt_entry.focus()
+    refresh_records()
+
+# ── Refresh treeview ──────────────────────────────────────────────────────────
+def refresh_records():
+    for r in tree.get_children(): tree.delete(r)
+    conn = sqlite3.connect(DB_FILE)
+    rows = conn.execute("SELECT Pt_Name,Ref_Doctor,Treatment_Type,Sonography_Date,Report_Type,Price,Sonography_Doctor FROM Muktajivan_Data ORDER BY rowid DESC LIMIT 100").fetchall()
+    conn.close()
+    for r in rows: tree.insert('',tk.END,values=r)
+
+def delete_selected():
+    sel = tree.selection()
+    if not sel: messagebox.showinfo("Info","Select a record to delete."); return
+    v = tree.item(sel[0],'values')
+    if not messagebox.askyesno("Confirm",f"Delete record for '{v[0]}'?"): return
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("DELETE FROM Muktajivan_Data WHERE rowid=(SELECT rowid FROM Muktajivan_Data WHERE Pt_Name=? AND Ref_Doctor=? AND Sonography_Date=? LIMIT 1)",(v[0],v[1],v[3]))
+    conn.commit(); conn.close()
+    export_csv(); refresh_records()
+
+# ── Scan tab logic ────────────────────────────────────────────────────────────
+scan_image_path = None
+scan_results    = []
+
+def browse_image():
+    global scan_image_path
+    path = filedialog.askopenfilename(
+        title="Select Handwriting Image",
+        filetypes=[("Image files","*.jpg *.jpeg *.png *.webp *.gif"),("All files","*.*")]
+    )
+    if not path: return
+    scan_image_path = path
+    img_label_path.config(text=os.path.basename(path))
+    # Show thumbnail
+    try:
+        img = Image.open(path)
+        img.thumbnail((320,240))
+        photo = ImageTk.PhotoImage(img)
+        img_preview.config(image=photo); img_preview.image = photo
+    except Exception as e:
+        img_preview.config(image=''); messagebox.showwarning("Preview","Could not preview image:\n"+str(e))
+    extract_btn.config(state='normal')
+    scan_status.config(text="Image loaded. Click 'Extract from Image' to start.", foreground='#185FA5')
+
+def do_extract():
+    global scan_results
+    api_key = api_key_entry.get().strip()
+    if not api_key:
+        messagebox.showwarning("API Key","Please enter your Google Gemini API key in the Settings tab."); return
+    if not scan_image_path:
+        messagebox.showwarning("No Image","Please select an image first."); return
+    save_api_key(api_key)
+    extract_btn.config(state='disabled')
+    scan_status.config(text="⏳ Sending to AI... please wait.", foreground='#8B6914')
+    save_all_btn.config(state='disabled')
+    for r in scan_tree.get_children(): scan_tree.delete(r)
+
+    def run():
+        global scan_results
+        try:
+            scan_results = call_gemini_api(scan_image_path, api_key)
+            root.after(0, show_scan_results)
+        except urllib.error.HTTPError as e:
+            err = e.read().decode()
+            root.after(0, lambda: scan_status.config(text=f"API Error {e.code}: {err[:120]}", foreground='red'))
+            root.after(0, lambda: extract_btn.config(state='normal'))
+        except Exception as e:
+            root.after(0, lambda: scan_status.config(text=f"Error: {str(e)[:150]}", foreground='red'))
+            root.after(0, lambda: extract_btn.config(state='normal'))
+
+    threading.Thread(target=run, daemon=True).start()
+
+def show_scan_results():
+    global scan_results
+    for r in scan_tree.get_children(): scan_tree.delete(r)
+    for i,rec in enumerate(scan_results):
+        scan_tree.insert('',tk.END,iid=str(i),values=(
+            rec.get('pt_name',''),
+            rec.get('ref_doctor',''),
+            rec.get('treatment_type',''),
+            rec.get('date',''),
+            rec.get('report_type',''),
+            rec.get('price',''),
+            rec.get('sono_doctor','')
+        ))
+    count = len(scan_results)
+    scan_status.config(text=f"✅ Extracted {count} patient record(s). Review below, then click 'Save All to DB & Excel'.", foreground='#2E7D32')
+    extract_btn.config(state='normal')
+    if count > 0: save_all_btn.config(state='normal')
+
+def save_all_scanned():
+    if not scan_results:
+        messagebox.showinfo("Info","No extracted records to save."); return
+    conn = sqlite3.connect(DB_FILE)
+    saved = 0
+    for rec in scan_results:
+        pt   = rec.get('pt_name','').strip()
+        doc  = rec.get('ref_doctor','').strip()
+        trt  = rec.get('treatment_type','').strip()
+        dt   = rec.get('date','').strip()
+        rpt  = rec.get('report_type','').strip()
+        prc  = rec.get('price','').strip()
+        sdoc = rec.get('sono_doctor','').strip()
+        if not pt: continue   # skip blank rows
+        conn.execute("INSERT INTO Muktajivan_Data(Pt_Name,Ref_Doctor,Treatment_Type,Sonography_Date,Report_Type,Price,Sonography_Doctor) VALUES(?,?,?,?,?,?,?)",
+                     (pt,doc,trt,dt,rpt,prc,sdoc))
+        saved += 1
+    conn.commit(); conn.close()
+    export_csv()
+    excel_path = export_excel()
+    refresh_records()
+    messagebox.showinfo("Saved",f"✅ {saved} records saved to database!\n📄 Excel updated: {excel_path}\n📋 CSV updated: {CSV_FILE}")
+    scan_status.config(text=f"✅ {saved} records saved. Excel & CSV updated.", foreground='#2E7D32')
+    save_all_btn.config(state='disabled')
+
+# ── BUILD UI ──────────────────────────────────────────────────────────────────
+init_db()
+root = tk.Tk()
+root.title("Muktajivan Sonography — Data Entry")
+root.resizable(True,True)
+
+notebook = ttk.Notebook(root)
+notebook.pack(fill='both',expand=True,padx=10,pady=10)
+
+# ── TAB 1: Add Record ─────────────────────────────────────────────────────────
+entry_tab = ttk.Frame(notebook)
+notebook.add(entry_tab, text="  ✚  Add Record  ")
+
+form = ttk.LabelFrame(entry_tab,text="Patient & Doctor Info",padding=10)
+form.grid(row=0,column=0,sticky='ew',padx=10,pady=(10,5))
+form.columnconfigure((0,1,2),weight=1)
+
+ttk.Label(form,text="Patient Name *").grid(row=0,column=0,sticky='w')
+ttk.Label(form,text="Ref Doctor Name *").grid(row=0,column=1,sticky='w')
+ttk.Label(form,text="Treatment Type *").grid(row=0,column=2,sticky='w')
+
+pt_entry        = ttk.Entry(form,width=24)
+doc_entry       = ttk.Entry(form,width=24)
+treatment_combo = ttk.Combobox(form,values=TREATMENT_TYPES,width=22,state='readonly')
+
+pt_entry.grid(row=1,column=0,sticky='ew',padx=(0,8))
+doc_entry.grid(row=1,column=1,sticky='ew',padx=(0,8))
+treatment_combo.grid(row=1,column=2,sticky='ew')
+
+date_frame = ttk.LabelFrame(entry_tab,text="Sonography Date",padding=10)
+date_frame.grid(row=1,column=0,sticky='ew',padx=10,pady=5)
+today = date.today()
+for i,lbl in enumerate(["Day","Month","Year"]):
+    ttk.Label(date_frame,text=lbl).grid(row=0,column=i,padx=8)
+day_spin   = ttk.Spinbox(date_frame,from_=1,   to=31,  width=6);  day_spin.insert(0,today.day)
+month_spin = ttk.Spinbox(date_frame,from_=1,   to=12,  width=6);  month_spin.insert(0,today.month)
+year_spin  = ttk.Spinbox(date_frame,from_=2020,to=2099,width=8);  year_spin.insert(0,today.year)
+day_spin.grid(row=1,column=0,padx=8); month_spin.grid(row=1,column=1,padx=8); year_spin.grid(row=1,column=2,padx=8)
+
+detail_frame = ttk.LabelFrame(entry_tab,text="Sonography Details",padding=10)
+detail_frame.grid(row=2,column=0,sticky='ew',padx=10,pady=5)
+detail_frame.columnconfigure((0,1,2),weight=1)
+
+ttk.Label(detail_frame,text="Report Type *").grid(row=0,column=0,sticky='w')
+ttk.Label(detail_frame,text="Price (Rs)").grid(row=0,column=1,sticky='w')
+ttk.Label(detail_frame,text="Sonography Doctor").grid(row=0,column=2,sticky='w')
+
+report_combo  = ttk.Combobox(detail_frame,values=REPORT_TYPES,width=30,state='readonly')
+price_entry   = ttk.Entry(detail_frame,width=12)
+sonodoc_entry = ttk.Entry(detail_frame,width=24)
+
+report_combo.grid(row=1,column=0,sticky='ew',padx=(0,8))
+price_entry.grid(row=1,column=1,sticky='ew',padx=(0,8))
+sonodoc_entry.grid(row=1,column=2,sticky='ew')
+
+for w in (form,date_frame,detail_frame):
+    for child in w.winfo_children(): child.grid_configure(padx=4,pady=4)
+
+bf = ttk.Frame(entry_tab); bf.grid(row=3,column=0,pady=10)
+ttk.Button(bf,text="💾  Save Record",  command=savedata,        width=18).pack(side='left',padx=6)
+ttk.Button(bf,text="🔄  Clear Form",   command=full_clear_form, width=14).pack(side='left',padx=6)
+
+# ── TAB 2: Scan Handwriting ───────────────────────────────────────────────────
+scan_tab = ttk.Frame(notebook)
+notebook.add(scan_tab, text="  📷  Scan Handwriting  ")
+
+top_scan = ttk.Frame(scan_tab); top_scan.pack(fill='x',padx=10,pady=8)
+
+ttk.Button(top_scan,text="📂  Browse Image",command=browse_image,width=18).pack(side='left',padx=(0,8))
+img_label_path = ttk.Label(top_scan,text="No image selected",foreground='gray')
+img_label_path.pack(side='left')
+
+extract_btn = ttk.Button(top_scan,text="🤖  Extract from Image",command=do_extract,width=22,state='disabled')
+extract_btn.pack(side='right')
+
+# Preview + status
+mid_scan = ttk.Frame(scan_tab); mid_scan.pack(fill='x',padx=10)
+img_preview = ttk.Label(mid_scan,text="[Image preview will appear here]",
+                        relief='sunken',width=40,anchor='center')
+img_preview.pack(side='left',padx=(0,12),pady=4)
+
+scan_status = ttk.Label(mid_scan,text="Select an image to begin.",
+                        foreground='gray',wraplength=380,justify='left')
+scan_status.pack(side='left',anchor='nw',pady=4)
+
+# Scan results table
+scan_cols = ('Patient','Ref Doctor','Treatment','Date','Report Type','Price','Sono Doctor')
+scan_tree = ttk.Treeview(scan_tab,columns=scan_cols,show='headings',height=10)
+scan_widths = [140,140,120,90,190,70,130]
+for col,w in zip(scan_cols,scan_widths):
+    scan_tree.heading(col,text=col); scan_tree.column(col,width=w,anchor='w')
+sy2 = ttk.Scrollbar(scan_tab,orient='vertical',command=scan_tree.yview)
+sx2 = ttk.Scrollbar(scan_tab,orient='horizontal',command=scan_tree.xview)
+scan_tree.configure(yscrollcommand=sy2.set,xscrollcommand=sx2.set)
+scan_tree.pack(side='left',fill='both',expand=True,padx=(10,0),pady=4)
+sy2.pack(side='left',fill='y',pady=4)
+sx2.pack(side='bottom',fill='x',padx=10)
+
+bf2 = ttk.Frame(scan_tab); bf2.pack(pady=6)
+save_all_btn = ttk.Button(bf2,text="💾  Save All to DB & Excel",command=save_all_scanned,width=26,state='disabled')
+save_all_btn.pack(side='left',padx=6)
+ttk.Button(bf2,text="📤  Export Excel Only",command=lambda:[export_excel(),messagebox.showinfo("Exported",f"Saved: {EXCEL_FILE}")],width=18).pack(side='left',padx=6)
+
+# ── TAB 3: View Records ───────────────────────────────────────────────────────
+view_tab = ttk.Frame(notebook)
+notebook.add(view_tab, text="  📋  View Records  ")
+
+cols = ('Patient','Ref Doctor','Treatment','Date','Report Type','Price','Sono Doctor')
+tree = ttk.Treeview(view_tab,columns=cols,show='headings',height=18)
+for col,w in zip(cols,[140,140,130,90,200,70,140]):
+    tree.heading(col,text=col); tree.column(col,width=w,anchor='w')
+sy = ttk.Scrollbar(view_tab,orient='vertical',command=tree.yview)
+sx = ttk.Scrollbar(view_tab,orient='horizontal',command=tree.xview)
+tree.configure(yscrollcommand=sy.set,xscrollcommand=sx.set)
+tree.grid(row=0,column=0,sticky='nsew'); sy.grid(row=0,column=1,sticky='ns'); sx.grid(row=1,column=0,sticky='ew')
+view_tab.rowconfigure(0,weight=1); view_tab.columnconfigure(0,weight=1)
+
+bf3 = ttk.Frame(view_tab); bf3.grid(row=2,column=0,pady=6)
+ttk.Button(bf3,text="🔃  Refresh",         command=refresh_records,width=14).pack(side='left',padx=5)
+ttk.Button(bf3,text="🗑  Delete Selected",  command=delete_selected,width=18).pack(side='left',padx=5)
+ttk.Button(bf3,text="📊  Export Excel",     command=lambda:[export_excel(),messagebox.showinfo("Exported",f"Saved: {EXCEL_FILE}")],width=14).pack(side='left',padx=5)
+ttk.Button(bf3,text="📤  Export CSV",       command=lambda:[export_csv(),messagebox.showinfo("Exported",f"Saved: {CSV_FILE}")],width=14).pack(side='left',padx=5)
+
+# ── TAB 4: Settings ───────────────────────────────────────────────────────────
+settings_tab = ttk.Frame(notebook)
+notebook.add(settings_tab, text="  ⚙  Settings  ")
+
+sf = ttk.LabelFrame(settings_tab,text="Google Gemini API Key (FREE — required for Scan feature)",padding=14)
+sf.pack(fill='x',padx=16,pady=14)
+
+ttk.Label(sf,text="API Key:").grid(row=0,column=0,sticky='w',padx=(0,8))
+api_key_entry = ttk.Entry(sf,width=54,show='*')
+api_key_entry.grid(row=0,column=1,sticky='ew')
+api_key_entry.insert(0,load_api_key())
+
+def toggle_show():
+    api_key_entry.config(show='' if api_key_entry.cget('show')=='*' else '*')
+ttk.Button(sf,text="Show/Hide",command=toggle_show,width=10).grid(row=0,column=2,padx=6)
+ttk.Button(sf,text="💾 Save Key",command=lambda:[save_api_key(api_key_entry.get()),messagebox.showinfo("Saved","API key saved.")],width=12).grid(row=1,column=1,sticky='w',pady=6)
+
+ttk.Label(sf,text="Get FREE API key at: https://aistudio.google.com  (Sign in with Gmail → Get API Key)",
+          foreground='#185FA5').grid(row=2,column=0,columnspan=3,sticky='w',pady=(4,0))
+
+ttk.Label(settings_tab,
+    text="Required packages:  pip install pillow openpyxl",
+    foreground='gray').pack(anchor='w',padx=16,pady=6)
+
+# ── Start ─────────────────────────────────────────────────────────────────────
+refresh_records()
+root.mainloop()
